@@ -6,7 +6,11 @@ pydantic-settings==2.5.2
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.9
-
+psycopg2-binary==2.9.9
 requests==2.32.3
 python-dotenv==1.0.1
 gunicorn==23.0.0
+# 1.2.0
+openpyxl==3.1.5      # .xlsx schedule import
+xlrd==2.0.1          # .xls schedule import
+tzdata               # Asia/Dhaka time zone data (required on Windows)

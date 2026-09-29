@@ -1,172 +1,93 @@
-# Hospital Management API
+# Hospital Management API — v1.2.0
 
-A simple FastAPI backend with login, patient records, doctor records, and appointments.
+FastAPI backend implementing `tests/hospital-api-v1_2_openapi.yaml`: patients, doctors,
+departments, weekly OPD schedules with exceptions and holidays, computed availability,
+appointments with server-assigned serials, schedule import, audit log, and the hospital
+content the voice agent reads (profile, packages, services, articles).
 
-## Features
-- **Login only** — no registration endpoint. A single user is created via a seed script.
-- **Patients** — name, age, mobile number (full CRUD).
-- **Doctors** — name, designation, education, specialization, description, mobile, email (full CRUD).
-- **Appointments** — links a patient + doctor with date, time, status, notes (full CRUD).
-- Works with **SQLite** out of the box, or **PostgreSQL** by changing one env variable.
-- JWT bearer-token auth; every route except `/` and `/auth/login` requires a valid token.
-
-## Project structure
-```
-app/
-  main.py           FastAPI app, mounts routers, creates tables on startup
-  config.py         Settings (reads .env)
-  database.py       SQLAlchemy engine/session
-  models.py         User, Patient, Doctor, Appointment tables
-  schemas.py        Pydantic request/response models
-  security.py       Password hashing + JWT create/verify
-  deps.py           get_current_user dependency (JWT auth guard)
-  seed.py           One-time script to create the login user
-  routers/
-    auth.py         POST /auth/login
-    patients.py     /patients CRUD
-    doctors.py      /doctors CRUD
-    appointments.py /appointments CRUD
-```
+SQLite out of the box; PostgreSQL by changing `DATABASE_URL`. Auth is an `X-API-Key` header.
 
 ## Setup
 
-1. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. **Configure environment**
-   ```bash
-   cp .env.example .env
-   ```
-   By default `DATABASE_URL` points at SQLite (`sqlite:///./hospital.db`) — no extra setup needed.
-
-   To use PostgreSQL instead, edit `.env`:
-   ```
-   DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<dbname>
-   ```
-   (Make sure the database itself already exists — the app creates tables, not the database.)
-
-   Also set your own `SECRET_KEY`, and the login credentials `ADMIN_USERNAME` / `ADMIN_PASSWORD`.
-
-3. **Create the login user** (there is no registration endpoint — this is the only way a user gets created)
-   ```bash
-   python -m app.seed
-   ```
-
-4. **Run the server**
-   ```bash
-   uvicorn app.main:app --reload
-   ```
-
-5. **Open the interactive docs**: http://127.0.0.1:8000/docs
-   Click "Authorize" and log in with the seeded username/password to try protected routes directly from Swagger UI.
-
-## Auth flow
-
-`POST /auth/login` — form-encoded (`username`, `password`), returns:
-```json
-{ "api_key": "..." }
-```
-Send it back on every other request as the `X-API-Key` header (not an Authorization/Bearer token):
-```
-X-API-Key: <api_key>
-```
-
-## Example requests (curl)
-
 ```bash
-# Login
-curl -X POST http://127.0.0.1:8000/auth/login \
-  -d "username=admin&password=admin123" \
-  -H "Content-Type: application/x-www-form-urlencoded"
-
-# Create a doctor (use the token from above)
-curl -X POST http://127.0.0.1:8000/doctors \
-  -H "X-API-Key: <KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "name": "Dr. Anika Rahman",
-        "designation": "Consultant",
-        "education": "MBBS, FCPS (Medicine)",
-        "specialization": "Cardiology",
-        "description": "15 years experience in cardiac care",
-        "mobile_number": "01711111111",
-        "email": "anika@example.com"
-      }'
-
-# Create a patient
-curl -X POST http://127.0.0.1:8000/patients \
-  -H "X-API-Key: <KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Karim Uddin", "age": 34, "mobile_number": "01812345678"}'
-
-# Book an appointment
-curl -X POST http://127.0.0.1:8000/appointments \
-  -H "X-API-Key: <KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "patient_id": 1,
-        "doctor_id": 1,
-        "appointment_date": "2026-09-20",
-        "appointment_time": "10:30:00",
-        "notes": "Follow-up checkup"
-      }'
-```
-
-## Endpoints
-
-| Method | Path                     | Description                          |
-|--------|---------------------------|---------------------------------------|
-| POST   | `/auth/login`             | Log in, get JWT token                 |
-| POST   | `/patients`                | Create patient                        |
-| GET    | `/patients`                | List patients (`search`, pagination)  |
-| GET    | `/patients/{id}`           | Get one patient                       |
-| PUT    | `/patients/{id}`           | Update patient                        |
-| DELETE | `/patients/{id}`           | Delete patient                        |
-| POST   | `/doctors`                 | Create doctor                         |
-| GET    | `/doctors`                 | List doctors (`specialization`, `search`) |
-| GET    | `/doctors/{id}`            | Get one doctor                        |
-| PUT    | `/doctors/{id}`            | Update doctor                         |
-| DELETE | `/doctors/{id}`            | Delete doctor                         |
-| POST   | `/appointments`            | Book appointment                      |
-| GET    | `/appointments`            | List appointments (filter by patient/doctor/status) |
-| GET    | `/appointments/{id}`       | Get one appointment (with patient+doctor details) |
-| PUT    | `/appointments/{id}`       | Update/reschedule/cancel appointment  |
-| DELETE | `/appointments/{id}`       | Delete appointment                    |
-
-## Production deployment (nginx + systemd)
-
-Config files are in `deploy/`:
-- `deploy/hospital-api.service` — systemd unit running the app via gunicorn + uvicorn workers on `127.0.0.1:8000`
-- `deploy/nginx.conf` — nginx reverse proxy, terminating on port 80 and forwarding to that upstream
-
-```bash
-# On the server, e.g. in /opt/hospital_api
-python3 -m venv venv
-source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # edit SECRET_KEY, DATABASE_URL, admin creds
-python -m app.seed
+cp .env.example .env          # set ADMIN_*, optionally AGENT_*
+python -m app.seed            # creates the login users and prints their API keys
+uvicorn app.main:app --reload
+```
+Docs: `http://127.0.0.1:8000/docs`.
 
-sudo cp deploy/hospital-api.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now hospital-api
+## Upgrading an existing 1.0.0 database
 
-sudo cp deploy/nginx.conf /etc/nginx/sites-available/hospital-api
-sudo ln -s /etc/nginx/sites-available/hospital-api /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
+Nothing to delete. On startup (or with `python -m app.migrate`) the app **adds** the new
+tables, columns and indexes and back-fills what it must; it never drops or rewrites data:
 
-# then HTTPS:
-sudo certbot --nginx -d api.yourdomain.com
+- existing users become `admin` scope,
+- existing appointments get a `serial_number` (per doctor and date, in id order),
+- patient phone numbers get a normalised form for the exact `mobile_number` filter,
+- the hospital profile row is created.
+
+Legacy appointments have no schedule link, so they don't count against a session's capacity.
+Then `python -m app.seed` to create the `agent` user if you want one.
+
+**On the IIS server:** activate the venv, `pip install -r requirements.txt` (new: `openpyxl`,
+`xlrd`, `tzdata`), then recycle the app pool (or `iisreset`) so IIS restarts uvicorn.
+
+## Scopes
+
+| | `admin` | `agent` (voice agent) |
+|---|---|---|
+| Read | everything | everything except `/audit-log` |
+| Write | everything | **only** patients and appointments — else `403 FORBIDDEN_SCOPE` |
+| Doctor `mobile_number`/`email`, exception/holiday `note` | returned | **omitted** |
+| Inactive / unpublished / soft-deleted content | returned by id and lists with `include_deleted` | hidden, unless `include_deleted=true` (sync) |
+
+## Booking rules (`POST /appointments`)
+
+One transaction: past date → `PAST_DATE`; holiday → `HOLIDAY`; resolve the session
+(`NO_SESSION` / `SESSION_REQUIRED`); duplicate patient+doctor+date → `DUPLICATE_BOOKING`;
+choose the regular or report queue; lowest free serial or `SESSION_FULL`; derive the time.
+`NO_SESSION`, `SESSION_FULL` and `HOLIDAY` carry `next_available_date`. Partial unique indexes
+back this up, so concurrent requests can't take the same serial (see `tests/test_concurrency.py`).
+`Idempotency-Key` is honoured on `POST /patients` and `POST /appointments`.
+
+## Schedule import
+
+`POST /schedules/import?mode=preview|apply` (admin). **Always preview first** — preview runs
+the identical code and rolls back. Accepts `.xlsx`, `.xls` and CSV
+(`doctor_id|doctor_name, weekday, start_time, end_time, room, floor, desk, max_patients[, slot_minutes, report_capacity]`).
+Apply is refused with `409 IMPORT_HAS_ERRORS` while any problem has severity `error`.
+
+Behaviour worth knowing:
+- Only doctors whose sessions actually change are touched; unchanged doctors are skipped.
+- Changed doctors: current rows are end-dated (`valid_to = valid_from - 1`), new rows created.
+- Future bookings on an end-dated row are **re-pointed** at the new row that contains their
+  time when that is unambiguous (serial, date and time never change); the rest are returned
+  in `affected_appointments`.
+- `slot_minutes` and `report_capacity` are carried over from the doctor's current row for
+  that weekday when the file gives none (the spreadsheet has no such columns).
+
+## Sync (voice agent search index)
+
+Lists of departments, doctors, packages, services and articles accept `updated_since` and
+`include_deleted`, and return `X-Server-Time`. Deletes on these are soft (`deleted_at`).
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q                 # 29 tests incl. import, 1.0.0 upgrade, race
+python tests/check_contract.py            # diff of the app's OpenAPI against the yaml
 ```
 
-Edit `server_name` in `deploy/nginx.conf` before enabling it.
+## Deployment
 
-## Notes
-- Deleting a patient or doctor also deletes their appointments (cascade).
-- `appointments.status` is one of: `scheduled`, `completed`, `cancelled`.
-- Tables are auto-created on startup (`Base.metadata.create_all`) — fine for development/small
-  deployments. For production Postgres with evolving schema, consider adding Alembic migrations.
-- If you see a bcrypt/passlib version error, make sure `bcrypt==4.0.1` (pinned in
-  `requirements.txt`) is installed — newer bcrypt releases break passlib's version check.
+See `deploy/` (nginx, IIS + ARR, IIS + HttpPlatformHandler, Windows service, systemd).
+On Windows use a single uvicorn process (no `--workers`).
+
+## Assumptions where the spec is silent
+- `IMPORT_HAS_ERRORS`: `candidates` carries the list of problems.
+- Files over 5 MB and unreadable files return `415 UNSUPPORTED_FILE`.
+- `leave` on a date also switches off an `extra_session` on that date.
+- An explicit `null` on a non-nullable field in a `PUT` means "unchanged".
+- Time values are serialised as `HH:MM` (as in the spec's examples).

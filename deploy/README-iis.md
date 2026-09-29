@@ -9,7 +9,7 @@ Same as before — do this first if not already done:
 
 ```powershell
 cd C:\hospital_api
-C:\arcgispro-py3-clone\python.exe -m venv venv
+python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env

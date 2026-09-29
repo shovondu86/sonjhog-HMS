@@ -1,0 +1,2786 @@
+openapi: 3.1.0
+info:
+  title: Hospital Management API
+  version: 1.2.0
+  description: |
+    Patients, doctors, departments, OPD schedules, appointments, and the
+    hospital information the call centre's voice agent reads to callers.
+
+    This API is the SINGLE SOURCE for everything the voice agent says.
+    Structured data (schedules, availability, prices, hours, rooms) is read
+    live at the moment a caller asks. Prose (department descriptions,
+    services, FAQ articles) is authored here and copied into the agent's
+    search index by a sync job that polls `updated_since` (see "Sync").
+
+    ## What changed in 1.2.0
+
+    - NEW `Holidays` — hospital-wide closures. Availability returns a
+      `holiday` status and booking refuses the date with `409 HOLIDAY`.
+    - NEW `visit_type` on appointments (`new`, `follow_up`,
+      `report_showing`) and an optional separate report-showing queue per
+      session (`report_capacity`).
+    - NEW `POST /schedules/import` — upload the OPD room-allocation
+      spreadsheet (or CSV), preview the result, then apply it.
+    - NEW `GET /audit-log` — who changed what, when, with before/after.
+    - NEW `Hospital` profile — address, hotlines, emails, OPD and desk
+      hours (replaces the voice agent's `CRM_OPENING_HOURS` setting).
+    - NEW `Packages`, `Services` (including facility rooms) and `Articles`
+      (FAQ and general content).
+    - CHANGED `Department` — adds `description_bn` and `conditions`.
+    - NEW sync convention: `updated_since` and `include_deleted` on every
+      content list; content deletes are soft (`deleted_at`).
+    - NEW (optional) `Queue` — the serial currently being seen.
+
+    ## What changed in 1.1.0
+
+    1.1.0 moves doctor schedules, rooms and departments out of the voice
+    agent's knowledge base (the OPD room-allocation spreadsheet) and into this
+    API, so a schedule edited here is what callers hear on the very next call.
+
+    - NEW `Departments` resource; doctors reference one by `department_id`.
+    - NEW `DoctorSchedule` (weekly OPD sessions with room, floor, desk, capacity).
+    - NEW `ScheduleException` (leave, cancelled sessions, extra sessions).
+    - NEW computed availability: `GET /doctors/{doctor_id}/availability` and
+      `GET /availability`.
+    - CHANGED `Doctor`: adds `department_id`, `name_bn`, `is_active`,
+      `accepting_appointments`, `consultation_fee`; new list filters.
+    - CHANGED `Appointment`: the server assigns `serial_number` and the time,
+      validates the booking against the schedule, and rejects past dates,
+      days with no session, full sessions and duplicate bookings with a
+      machine-readable `code` (see `ErrorResponse`).
+    - CHANGED `POST /patients` and `POST /appointments` accept an
+      `Idempotency-Key` header.
+    - CHANGED `GET /patients` adds an exact `mobile_number` filter.
+
+    Every 1.0.0 request stays valid. `AppointmentCreate.appointment_time` is
+    now optional (the server derives it), which loosens rather than breaks
+    the contract.
+
+    ## Time zone
+
+    All `date` and `time` values are hospital-local (Asia/Dhaka) and carry no
+    offset. "Today" and "past date" are judged by the Asia/Dhaka calendar.
+    `date-time` values (`created_at`, `updated_at`) are ISO 8601 with offset.
+
+    ## API key scopes
+
+    Keys are issued per user by `POST /auth/login` and sent as `X-API-Key`.
+    Each key has a scope:
+
+    - `admin` — full read/write on every resource.
+    - `agent` — the voice agent. Read on everything except `/audit-log`;
+      write ONLY on patients and appointments. Any other write returns
+      `403 FORBIDDEN_SCOPE`. For this scope:
+      - staff-private fields (`Doctor.mobile_number`, `Doctor.email`,
+        `ScheduleException.note`, `Holiday.note`) are OMITTED from responses;
+      - unpublished or inactive content (`Article.is_published = false`,
+        `is_active = false` packages/services/departments) is not returned
+        unless `include_deleted=true` is passed for sync.
+      Anything the agent receives it may read aloud to any caller.
+
+    ## Sync
+
+    Content the agent searches in free text — departments, doctors,
+    packages, services, articles, the hospital profile — supports:
+
+    - `updated_since=<date-time>`: only records whose `updated_at` (or
+      `deleted_at`) is after that instant. `updated_at` MUST be set on every
+      write, including create.
+    - `include_deleted=true`: also return soft-deleted, unpublished and
+      inactive records, so the sync job can remove them from its index.
+
+    `DELETE` on these resources is soft: it sets `deleted_at` and hides the
+    record from normal lists. The response header `X-Server-Time` on every
+    list gives the instant to pass as the next `updated_since`.
+
+    ## Errors
+
+    Validation failures keep FastAPI's `422 HTTPValidationError`. Business-rule
+    failures return `409` (or `404`/`403`) with an `ErrorResponse` body whose
+    `code` a client can branch on without parsing `detail`.
+servers:
+  - url: http://103.141.67.150
+    description: Current instance (plain HTTP — TLS strongly recommended)
+security:
+  - APIKeyHeader: []
+tags:
+  - name: Auth
+  - name: Patients
+  - name: Departments
+    description: NEW in 1.1.0
+  - name: Doctors
+  - name: Schedules
+    description: NEW in 1.1.0 — weekly OPD sessions and exceptions
+  - name: Availability
+    description: NEW in 1.1.0 — computed, read-only
+  - name: Holidays
+    description: NEW in 1.2.0 — hospital-wide closures
+  - name: Appointments
+  - name: Imports
+    description: NEW in 1.2.0 — upload the OPD room-allocation spreadsheet
+  - name: Audit
+    description: NEW in 1.2.0 — change history (admin only)
+  - name: Hospital
+    description: NEW in 1.2.0 — address, contacts, hours
+  - name: Packages
+    description: NEW in 1.2.0 — health check-up packages
+  - name: Services
+    description: NEW in 1.2.0 — services and facility rooms
+  - name: Articles
+    description: NEW in 1.2.0 — FAQ and general content
+  - name: Queue
+    description: NEW in 1.2.0, OPTIONAL — the serial currently being seen
+  - name: Health
+
+paths:
+  # ── Auth (unchanged) ─────────────────────────────────────────────────────
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      operationId: login_auth_login_post
+      security: []
+      description: |
+        Simple login — no registration endpoint exists.
+        Users are created only via the seed script (app/seed.py).
+
+        Returns the user's persistent API key. Send it back on every other
+        request as the `X-API-Key` header (not an Authorization/Bearer token).
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/Body_login_auth_login_post' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ── Patients ─────────────────────────────────────────────────────────────
+  /patients:
+    post:
+      tags: [Patients]
+      summary: Create Patient
+      operationId: create_patient_patients_post
+      description: |
+        CHANGED in 1.1.0: accepts `Idempotency-Key`. A repeated request with
+        the same key returns the original `201` body instead of creating a
+        second patient.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatientCreate' }
+      responses:
+        '201':
+          description: Created (or the original result of a repeated Idempotency-Key)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatientOut' }
+        '409':
+          description: |
+            `IDEMPOTENCY_KEY_REUSED` — the key was already used with a
+            different request body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [Patients]
+      summary: List Patients
+      operationId: list_patients_patients_get
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: search
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: Substring match on name or mobile number.
+        - name: mobile_number
+          in: query
+          required: false
+          schema: { type: [string, 'null'], maxLength: 20 }
+          description: |
+            NEW in 1.1.0. EXACT match after normalising both sides to the
+            11-digit national form: strip everything but digits, drop a
+            leading `88`, so `+8801712345678`, `8801712345678`,
+            `01712-345678` and `01712345678` all match the same patient.
+            Wildcards are not interpreted.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PatientOut' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /patients/{patient_id}:
+    parameters:
+      - name: patient_id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Patients]
+      summary: Get Patient
+      operationId: get_patient_patients__patient_id__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatientOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    put:
+      tags: [Patients]
+      summary: Update Patient
+      operationId: update_patient_patients__patient_id__put
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatientUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatientOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Patients]
+      summary: Delete Patient
+      operationId: delete_patient_patients__patient_id__delete
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ── Departments (NEW) ────────────────────────────────────────────────────
+  /departments:
+    get:
+      tags: [Departments]
+      summary: List Departments
+      operationId: list_departments_departments_get
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: search
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: |
+            Case-insensitive match against `name`, `name_bn` and every entry
+            of `aliases`, by word prefix (so `ent` matches "ENT, Head & Neck
+            Surgery" but not "Gastroenterology").
+        - name: service_line
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ServiceLine'
+              - type: 'null'
+        - name: is_active
+          in: query
+          required: false
+          schema: { type: [boolean, 'null'], default: true }
+        - $ref: '#/components/parameters/UpdatedSince'
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Successful Response
+          headers:
+            X-Server-Time: { $ref: '#/components/headers/XServerTime' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DepartmentOut' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    post:
+      tags: [Departments]
+      summary: Create Department
+      operationId: create_department_departments_post
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DepartmentCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepartmentOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`DUPLICATE_NAME`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /departments/{department_id}:
+    parameters:
+      - name: department_id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Departments]
+      summary: Get Department
+      operationId: get_department_departments__department_id__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepartmentOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Departments]
+      summary: Update Department
+      operationId: update_department_departments__department_id__put
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DepartmentUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepartmentOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Departments]
+      summary: Delete Department
+      operationId: delete_department_departments__department_id__delete
+      description: |
+        Requires `admin` scope. Refused with `409 HAS_DOCTORS` while any doctor
+        references it — set `is_active: false` instead. CHANGED in 1.2.0:
+        soft delete (sets `deleted_at`).
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`HAS_DOCTORS`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ── Doctors ──────────────────────────────────────────────────────────────
+  /doctors:
+    post:
+      tags: [Doctors]
+      summary: Create Doctor
+      operationId: create_doctor_doctors_post
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DoctorCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DoctorOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [Doctors]
+      summary: List Doctors
+      operationId: list_doctors_doctors_get
+      description: |
+        CHANGED in 1.1.0: new filters `department_id`, `is_active`,
+        `available_on`; `search` also matches `name_bn`.
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: specialization
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: Substring match on the display `specialization`. Prefer `department_id`.
+        - name: search
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: Substring match on `name` and `name_bn`. `%` and `_` are matched literally.
+        - name: department_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+          description: NEW in 1.1.0.
+        - name: is_active
+          in: query
+          required: false
+          schema: { type: [boolean, 'null'], default: true }
+          description: NEW in 1.1.0. Pass `null`/omit explicitly to include inactive doctors (admin views).
+        - name: available_on
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date }
+          description: |
+            NEW in 1.1.0. Only doctors with at least one session on that date
+            after applying exceptions and holidays (status `available` or
+            `full` in availability terms).
+        - $ref: '#/components/parameters/UpdatedSince'
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Successful Response
+          headers:
+            X-Server-Time: { $ref: '#/components/headers/XServerTime' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DoctorOut' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /doctors/{doctor_id}:
+    parameters:
+      - $ref: '#/components/parameters/DoctorId'
+    get:
+      tags: [Doctors]
+      summary: Get Doctor
+      operationId: get_doctor_doctors__doctor_id__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DoctorOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    put:
+      tags: [Doctors]
+      summary: Update Doctor
+      operationId: update_doctor_doctors__doctor_id__put
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DoctorUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DoctorOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Doctors]
+      summary: Delete Doctor
+      operationId: delete_doctor_doctors__doctor_id__delete
+      description: |
+        Requires `admin` scope. CHANGED in 1.1.0: refused with
+        `409 HAS_FUTURE_APPOINTMENTS` while the doctor has scheduled
+        appointments from today onward — set `is_active: false` instead.
+        CHANGED in 1.2.0: soft delete (sets `deleted_at`), so past
+        appointments keep their doctor.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`HAS_FUTURE_APPOINTMENTS`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ── Schedules (NEW) ──────────────────────────────────────────────────────
+  /doctors/{doctor_id}/schedules:
+    parameters:
+      - $ref: '#/components/parameters/DoctorId'
+    get:
+      tags: [Schedules]
+      summary: List Doctor Schedules
+      operationId: list_doctor_schedules
+      description: |
+        The doctor's weekly OPD sessions. A weekday with no row means NO
+        SESSION that day — there is no "unknown" state.
+      parameters:
+        - name: effective_on
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date }
+          description: |
+            Only rows valid on this date (`valid_from <= date` and
+            (`valid_to` is null or `valid_to >= date`)). Omit for all rows,
+            past and future.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScheduleOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Schedules]
+      summary: Create Doctor Schedule
+      operationId: create_doctor_schedule
+      description: |
+        Requires `admin` scope. Refused with `409 SCHEDULE_OVERLAP` if it
+        overlaps another session of the same doctor on the same weekday
+        within an overlapping validity range, and `409 ROOM_CONFLICT` if the
+        room/desk is already allocated to another doctor for an overlapping
+        time on that weekday.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`SCHEDULE_OVERLAP` or `ROOM_CONFLICT`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /schedules/{schedule_id}:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    get:
+      tags: [Schedules]
+      summary: Get Schedule
+      operationId: get_schedule
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Schedules]
+      summary: Update Schedule
+      operationId: update_schedule
+      description: |
+        Requires `admin` scope. Takes effect immediately for every future
+        date the row covers. To change a rota from a future date, end-date
+        this row (`valid_to`) and create a new one with `valid_from` instead.
+
+        Existing appointments are NEVER moved or cancelled by this call. Any
+        scheduled appointment from today onward that no longer falls inside
+        a session is returned in `affected_appointments` so staff can
+        contact those patients.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleChangeResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`SCHEDULE_OVERLAP` or `ROOM_CONFLICT`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Schedules]
+      summary: Delete Schedule
+      operationId: delete_schedule
+      description: |
+        Requires `admin` scope. Refused with `409 HAS_FUTURE_APPOINTMENTS`
+        while scheduled appointments from today onward are booked into this
+        session. To retire a session, set `valid_to` instead.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`HAS_FUTURE_APPOINTMENTS`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /doctors/{doctor_id}/exceptions:
+    parameters:
+      - $ref: '#/components/parameters/DoctorId'
+    get:
+      tags: [Schedules]
+      summary: List Schedule Exceptions
+      operationId: list_schedule_exceptions
+      parameters:
+        - name: date_from
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date }
+          description: Defaults to today.
+        - name: date_to
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScheduleExceptionOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Schedules]
+      summary: Create Schedule Exception
+      operationId: create_schedule_exception
+      description: |
+        Requires `admin` scope. Leave, a cancelled session, or an extra
+        one-off session on a single date. Takes effect immediately.
+
+        As with schedule updates, existing appointments are NOT cancelled:
+        those on the date that no longer fall inside a session are returned
+        in `affected_appointments`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleExceptionCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleExceptionResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`SCHEDULE_OVERLAP` or `ROOM_CONFLICT` (extra_session only)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /exceptions/{exception_id}:
+    parameters:
+      - name: exception_id
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      tags: [Schedules]
+      summary: Delete Schedule Exception
+      operationId: delete_schedule_exception
+      description: |
+        Requires `admin` scope. Refused with `409 HAS_FUTURE_APPOINTMENTS`
+        for an `extra_session` that has bookings.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`HAS_FUTURE_APPOINTMENTS`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ── Availability (NEW, computed) ─────────────────────────────────────────
+  /doctors/{doctor_id}/availability:
+    parameters:
+      - $ref: '#/components/parameters/DoctorId'
+    get:
+      tags: [Availability]
+      summary: Doctor Availability
+      operationId: get_doctor_availability
+      description: |
+        Weekly schedule, minus holidays, minus exceptions, minus bookings, per
+        date. This is the endpoint the voice agent calls; it must never be
+        cached for longer than a few seconds so a schedule change is heard on
+        the next call.
+
+        One entry per date in the range, including dates with no session.
+      parameters:
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DoctorAvailability' }
+              example:
+                doctor_id: 12
+                doctor_name: Prof. Dr. Khwaja Nazim Uddin
+                days:
+                  - date: '2026-09-27'
+                    weekday: sunday
+                    status: available
+                    sessions:
+                      - schedule_id: 40
+                        start_time: '09:00'
+                        end_time: '17:00'
+                        room: '3042'
+                        floor: 3rd
+                        desk: A
+                        capacity: 30
+                        booked: 12
+                        remaining: 18
+                        next_serial: 13
+                        report_capacity: 10
+                        report_booked: 2
+                        report_remaining: 8
+                        now_serving: null
+                  - date: '2026-09-28'
+                    weekday: monday
+                    status: leave
+                    sessions: []
+                  - date: '2026-09-30'
+                    weekday: wednesday
+                    status: holiday
+                    holiday_name: Durga Puja
+                    sessions: []
+                  - date: '2026-10-02'
+                    weekday: friday
+                    status: no_session
+                    sessions: []
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /availability:
+    get:
+      tags: [Availability]
+      summary: Availability By Department
+      operationId: get_availability
+      description: |
+        Every active doctor matching the filters with their availability on
+        the given date range — answers "which gynae doctor sits tomorrow?".
+        Doctors whose every day is `no_session` are omitted.
+      parameters:
+        - name: department_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DoctorAvailability' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ── Appointments ─────────────────────────────────────────────────────────
+  /appointments:
+    post:
+      tags: [Appointments]
+      summary: Create Appointment
+      operationId: create_appointment_appointments_post
+      description: |
+        CHANGED in 1.1.0 and 1.2.0. The server, in one transaction:
+
+        1. Rejects a date before today (Asia/Dhaka) — `PAST_DATE`.
+        2. Rejects a hospital holiday with `opd_closed` — `HOLIDAY`
+           (NEW in 1.2.0).
+        3. Resolves the session: `schedule_id` if given, otherwise the
+           doctor's only session that day. No session (no schedule row,
+           leave, cancelled) — `NO_SESSION`. More than one session and no
+           `schedule_id` — `SESSION_REQUIRED`.
+        4. Rejects a second non-cancelled appointment for the same patient,
+           doctor and date — `DUPLICATE_BOOKING`.
+        5. Picks the queue (NEW in 1.2.0): `report_showing` visits go to the
+           session's report queue when `report_capacity > 0`; everything
+           else, and report visits when `report_capacity` is 0, go to the
+           regular queue.
+        6. Assigns the lowest free `serial_number` in that queue, or
+           `SESSION_FULL` when the queue is full.
+        7. Derives `appointment_time`: for the regular queue,
+           `start_time + (serial_number - 1) * slot_minutes` when the session
+           has `slot_minutes`, otherwise the session's `start_time`. Report
+           queue appointments get the session's `start_time`. A
+           client-supplied `appointment_time` is ignored.
+
+        Enforced by unique indexes, not only by application checks, so two
+        concurrent requests cannot take the same serial. All are partial,
+        `WHERE status <> 'cancelled'`, so a cancelled appointment frees its
+        serial: `(schedule_id, appointment_date, queue, serial_number)`,
+        `(exception_id, queue, serial_number)`, and
+        `(patient_id, doctor_id, appointment_date)`.
+
+        The serial given is the LOWEST free one in the session, so a
+        cancellation's serial is reused before a new one is opened.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppointmentCreate' }
+      responses:
+        '201':
+          description: Created (or the original result of a repeated Idempotency-Key)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppointmentDetailOut' }
+        '404':
+          description: '`PATIENT_NOT_FOUND` or `DOCTOR_NOT_FOUND`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: |
+            `PAST_DATE`, `HOLIDAY`, `NO_SESSION`, `SESSION_REQUIRED`,
+            `SESSION_FULL`, `DUPLICATE_BOOKING`, `DOCTOR_NOT_ACCEPTING`, or
+            `IDEMPOTENCY_KEY_REUSED`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                full:
+                  value:
+                    code: SESSION_FULL
+                    detail: All 30 serials for 2026-09-27 are booked.
+                    next_available_date: '2026-09-29'
+                noSession:
+                  value:
+                    code: NO_SESSION
+                    detail: The doctor has no OPD session on 2026-10-02.
+                    next_available_date: '2026-10-03'
+                holiday:
+                  value:
+                    code: HOLIDAY
+                    detail: OPD is closed on 2026-09-30 (Durga Puja).
+                    holiday_name: Durga Puja
+                    next_available_date: '2026-10-01'
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [Appointments]
+      summary: List Appointments
+      operationId: list_appointments_appointments_get
+      description: |
+        CHANGED in 1.1.0: new filters `date_from`, `date_to`, `schedule_id`.
+        CHANGED in 1.2.0: new filter `visit_type`.
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: patient_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+        - name: doctor_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+        - name: schedule_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+          description: NEW in 1.1.0.
+        - name: status_filter
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/AppointmentStatus'
+              - type: 'null'
+        - name: date_from
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date }
+          description: NEW in 1.1.0. Inclusive.
+        - name: date_to
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date }
+          description: NEW in 1.1.0. Inclusive.
+        - name: visit_type
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/VisitType'
+              - type: 'null'
+          description: NEW in 1.2.0.
+      responses:
+        '200':
+          description: Successful Response, ordered by `appointment_date`, then `queue`, then `serial_number`.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AppointmentDetailOut' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /appointments/{appointment_id}:
+    parameters:
+      - name: appointment_id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Appointments]
+      summary: Get Appointment
+      operationId: get_appointment_appointments__appointment_id__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppointmentDetailOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    put:
+      tags: [Appointments]
+      summary: Update Appointment
+      operationId: update_appointment_appointments__appointment_id__put
+      description: |
+        CHANGED in 1.1.0. Setting `status: cancelled` frees the serial for
+        reuse. Changing `doctor_id`, `appointment_date` or `schedule_id`
+        re-runs every rule of `POST /appointments` and assigns a new serial.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppointmentUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppointmentDetailOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Same codes as `POST /appointments`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Appointments]
+      summary: Delete Appointment
+      operationId: delete_appointment_appointments__appointment_id__delete
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ── Holidays (NEW in 1.2.0) ──────────────────────────────────────────────
+  /holidays:
+    get:
+      tags: [Holidays]
+      summary: List Holidays
+      operationId: list_holidays
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema: { type: string, format: date }
+          description: Inclusive. Defaults to today.
+        - name: to
+          in: query
+          required: false
+          schema: { type: string, format: date }
+          description: Inclusive. Defaults to `from + 365 days`.
+      responses:
+        '200':
+          description: Successful Response, ordered by date.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/HolidayOut' }
+    post:
+      tags: [Holidays]
+      summary: Create Holiday
+      operationId: create_holiday
+      description: |
+        Requires `admin` scope. Takes effect immediately: availability shows
+        `holiday` and booking refuses the date. Existing appointments on the
+        date are NOT cancelled; they are returned in `affected_appointments`
+        so staff can contact the patients.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HolidayCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HolidayResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`DUPLICATE_DATE` — a holiday already exists on that date.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /holidays/{holiday_id}:
+    parameters:
+      - name: holiday_id
+        in: path
+        required: true
+        schema: { type: integer }
+    put:
+      tags: [Holidays]
+      summary: Update Holiday
+      operationId: update_holiday
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HolidayUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HolidayResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Holidays]
+      summary: Delete Holiday
+      operationId: delete_holiday
+      description: Requires `admin` scope. The date becomes bookable again immediately.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Schedule import (NEW in 1.2.0) ───────────────────────────────────────
+  /schedules/import:
+    post:
+      tags: [Imports]
+      summary: Import OPD Schedule
+      operationId: import_schedules
+      description: |
+        Requires `admin` scope. Upload the OPD room-allocation spreadsheet
+        (`.xls`, `.xlsx`) or the CSV format below, and replace the weekly
+        schedule of every doctor in the file.
+
+        ALWAYS call with `mode=preview` first. Preview parses and validates
+        and changes nothing. `mode=apply` repeats the same work and commits
+        it, and is refused with `409 IMPORT_HAS_ERRORS` if any problem has
+        severity `error`.
+
+        **Spreadsheet rules** (the hospital's existing layout):
+        - Merged day cells mean the same hours on every day they span. A
+          value merged across Saturday..Thursday is SIX sessions, not one.
+        - `x`, `X`, `-` in a day cell means no session that day. An EMPTY
+          day cell is an error (`BLANK_HOURS`) — the sheet does not say.
+        - `09:00 am To 12:00 pm & 03:00 pm To 08:00 pm` is TWO sessions.
+        - Section headers `OPD - (3rd Floor) Desk - A` set floor and desk
+          for the rows below them.
+        - Mobile numbers in the name cell are discarded, never stored.
+        - Rows naming a room but no doctor (PFT Room, EEG Room) are
+          reported as `FACILITY_ROW` warnings and not imported as schedules.
+
+        **CSV columns**: `doctor_id` (or `doctor_name`), `weekday`,
+        `start_time`, `end_time` (24-hour `HH:MM`), `room`, `floor`, `desk`,
+        `max_patients`, optional `slot_minutes`, `report_capacity`.
+
+        **What apply does**, per doctor in the file: every current schedule
+        row is end-dated (`valid_to = valid_from - 1`) and the file's
+        sessions are created with `valid_from`. Doctors NOT in the file are
+        untouched and listed as `NOT_IN_FILE` warnings. One transaction: all
+        or nothing. Written to the audit log as one `import` entry per
+        doctor.
+      parameters:
+        - name: mode
+          in: query
+          required: true
+          schema: { type: string, enum: [preview, apply] }
+        - name: valid_from
+          in: query
+          required: false
+          schema: { type: string, format: date }
+          description: |
+            First date the new schedule applies. Defaults to today. Must not
+            be in the past. Use a future date to load a new rota ahead of
+            time.
+        - name: default_max_patients
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+          description: |
+            Capacity for sessions the file gives none for (the spreadsheet
+            has no capacity column). Order of precedence: the file's value,
+            then the doctor's current capacity for that weekday, then this.
+            None of the three is a `MISSING_CAPACITY` error.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: .xls, .xlsx or .csv, at most 5 MB.
+      responses:
+        '200':
+          description: Preview or applied result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleImportResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`IMPORT_HAS_ERRORS` (apply only) — the body is the full `ScheduleImportResult`-shaped problem list under `candidates`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '415':
+          description: '`UNSUPPORTED_FILE`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ── Audit log (NEW in 1.2.0) ─────────────────────────────────────────────
+  /audit-log:
+    get:
+      tags: [Audit]
+      summary: List Audit Entries
+      operationId: list_audit_log
+      description: |
+        Requires `admin` scope. Every create, update, delete and import of
+        doctors, departments, schedules, exceptions, holidays, packages,
+        services, articles and the hospital profile, newest first. Entries
+        are never edited or deleted.
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: entity_type
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/AuditEntityType'
+              - type: 'null'
+        - name: entity_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+        - name: doctor_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+          description: Entries for the doctor AND their schedules and exceptions.
+        - name: user_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+        - name: from
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date-time }
+        - name: to
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date-time }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── Hospital profile (NEW in 1.2.0) ──────────────────────────────────────
+  /hospital:
+    get:
+      tags: [Hospital]
+      summary: Get Hospital Profile
+      operationId: get_hospital
+      description: The single hospital profile. Always exists (seeded on migration).
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HospitalOut' }
+    put:
+      tags: [Hospital]
+      summary: Update Hospital Profile
+      operationId: update_hospital
+      description: Requires `admin` scope. Partial update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HospitalUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HospitalOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ── Packages (NEW in 1.2.0) ──────────────────────────────────────────────
+  /packages:
+    get:
+      tags: [Packages]
+      summary: List Packages
+      operationId: list_packages
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: search
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: Matches `name`, `name_bn`, `aliases`, and investigation names.
+        - name: gender
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/PackageGender'
+              - type: 'null'
+          description: '`male` returns `male` and `any` packages; likewise `female`.'
+        - name: is_active
+          in: query
+          required: false
+          schema: { type: [boolean, 'null'], default: true }
+        - $ref: '#/components/parameters/UpdatedSince'
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Successful Response
+          headers:
+            X-Server-Time: { $ref: '#/components/headers/XServerTime' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PackageOut' }
+    post:
+      tags: [Packages]
+      summary: Create Package
+      operationId: create_package
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PackageCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PackageOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`DUPLICATE_NAME`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /packages/{package_id}:
+    parameters:
+      - name: package_id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Packages]
+      summary: Get Package
+      operationId: get_package
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PackageOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Packages]
+      summary: Update Package
+      operationId: update_package
+      description: Requires `admin` scope. Partial update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PackageUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PackageOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Packages]
+      summary: Delete Package
+      operationId: delete_package
+      description: Requires `admin` scope. Soft delete (sets `deleted_at`).
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Services (NEW in 1.2.0) ──────────────────────────────────────────────
+  /services:
+    get:
+      tags: [Services]
+      summary: List Services
+      operationId: list_services
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: search
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: Matches `name`, `name_bn` and `aliases`, by word prefix.
+        - name: kind
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ServiceKind'
+              - type: 'null'
+        - name: service_line
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ServiceLine'
+              - type: 'null'
+        - name: department_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+        - name: is_active
+          in: query
+          required: false
+          schema: { type: [boolean, 'null'], default: true }
+        - $ref: '#/components/parameters/UpdatedSince'
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Successful Response
+          headers:
+            X-Server-Time: { $ref: '#/components/headers/XServerTime' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ServiceOut' }
+    post:
+      tags: [Services]
+      summary: Create Service
+      operationId: create_service
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`DUPLICATE_NAME`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /services/{service_id}:
+    parameters:
+      - name: service_id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Services]
+      summary: Get Service
+      operationId: get_service
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Services]
+      summary: Update Service
+      operationId: update_service
+      description: Requires `admin` scope. Partial update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Services]
+      summary: Delete Service
+      operationId: delete_service
+      description: Requires `admin` scope. Soft delete (sets `deleted_at`).
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Articles (NEW in 1.2.0) ──────────────────────────────────────────────
+  /articles:
+    get:
+      tags: [Articles]
+      summary: List Articles
+      operationId: list_articles
+      description: |
+        FAQ and general content (how to book, about the hospital, careers,
+        policies, directions). `agent` keys see only published articles
+        unless `include_deleted=true`.
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+        - name: topic
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ArticleTopic'
+              - type: 'null'
+        - name: service_line
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ServiceLine'
+              - type: 'null'
+          description: Articles for that desk PLUS articles with no `service_line` (shared).
+        - name: is_published
+          in: query
+          required: false
+          schema: { type: [boolean, 'null'] }
+          description: Admin only. `agent` keys always get published articles.
+        - $ref: '#/components/parameters/UpdatedSince'
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Successful Response
+          headers:
+            X-Server-Time: { $ref: '#/components/headers/XServerTime' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ArticleOut' }
+    post:
+      tags: [Articles]
+      summary: Create Article
+      operationId: create_article
+      description: Requires `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ArticleCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticleOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /articles/{article_id}:
+    parameters:
+      - name: article_id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Articles]
+      summary: Get Article
+      operationId: get_article
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticleOut' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Articles]
+      summary: Update Article
+      operationId: update_article
+      description: Requires `admin` scope. Partial update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ArticleUpdate' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticleOut' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Articles]
+      summary: Delete Article
+      operationId: delete_article
+      description: Requires `admin` scope. Soft delete (sets `deleted_at`).
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Queue (NEW in 1.2.0, OPTIONAL) ───────────────────────────────────────
+  /queue:
+    get:
+      tags: [Queue]
+      summary: Today's Queue
+      operationId: get_queue
+      description: |
+        OPTIONAL feature. The serial currently being seen in each of today's
+        sessions, so the agent can answer "how far along is my serial?".
+        Only meaningful if OPD desk staff update it as patients go in.
+      parameters:
+        - name: doctor_id
+          in: query
+          required: false
+          schema: { type: [integer, 'null'] }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/QueueStatus' }
+
+  /queue/{schedule_id}:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    put:
+      tags: [Queue]
+      summary: Set Now Serving
+      operationId: set_now_serving
+      description: |
+        OPTIONAL feature. Sets today's `now_serving` for the session. Allowed
+        for `admin` keys (the OPD desk). Resets automatically each day.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [now_serving]
+              properties:
+                now_serving: { type: integer, minimum: 0, description: '0 means not started.' }
+                queue: { $ref: '#/components/schemas/QueueName' }
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueStatus' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Health (unchanged) ───────────────────────────────────────────────────
+  /:
+    get:
+      tags: [Health]
+      summary: Health Check
+      operationId: health_check__get
+      security: []
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+
+components:
+  securitySchemes:
+    APIKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    Skip:
+      name: skip
+      in: query
+      required: false
+      schema: { type: integer, default: 0, minimum: 0 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, default: 100, minimum: 1, maximum: 500 }
+    DoctorId:
+      name: doctor_id
+      in: path
+      required: true
+      schema: { type: integer }
+    ScheduleId:
+      name: schedule_id
+      in: path
+      required: true
+      schema: { type: integer }
+    DateFrom:
+      name: from
+      in: query
+      required: false
+      schema: { type: string, format: date }
+      description: Inclusive. Defaults to today (Asia/Dhaka).
+    DateTo:
+      name: to
+      in: query
+      required: false
+      schema: { type: string, format: date }
+      description: Inclusive. Defaults to `from + 6 days`. At most 31 days after `from`.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 8, maxLength: 128 }
+      description: |
+        NEW in 1.1.0. Client-generated, unique per logical operation. The
+        server stores the key with a hash of the request body and the response
+        for at least 24 hours. Same key + same body returns the stored
+        response (same status code). Same key + different body returns
+        `409 IDEMPOTENCY_KEY_REUSED`.
+    UpdatedSince:
+      name: updated_since
+      in: query
+      required: false
+      schema: { type: [string, 'null'], format: date-time }
+      description: |
+        NEW in 1.2.0. Only records created, updated or deleted after this
+        instant. Pass the previous response's `X-Server-Time`.
+    IncludeDeleted:
+      name: include_deleted
+      in: query
+      required: false
+      schema: { type: boolean, default: false }
+      description: |
+        NEW in 1.2.0. Also return soft-deleted, inactive and unpublished
+        records (each with `deleted_at` / `is_active` / `is_published` set),
+        so a sync job can remove them from its index.
+
+  headers:
+    XServerTime:
+      description: NEW in 1.2.0. Server time when the list was read; the next `updated_since`.
+      schema: { type: string, format: date-time }
+
+  responses:
+    ValidationError:
+      description: Validation Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HTTPValidationError' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: '`FORBIDDEN_SCOPE` — the API key''s scope does not allow this operation.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  schemas:
+    # ── common ─────────────────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      description: NEW in 1.1.0. Body of every business-rule error.
+      required: [code, detail]
+      properties:
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        detail:
+          type: string
+          description: Human-readable, English. Not for parsing.
+        next_available_date:
+          type: [string, 'null']
+          format: date
+          description: |
+            On `NO_SESSION`, `SESSION_FULL` and `HOLIDAY`: the doctor's next
+            date (within 31 days) with a free serial, so a client can offer
+            it directly.
+        holiday_name:
+          type: [string, 'null']
+          description: NEW in 1.2.0. On `HOLIDAY`.
+        candidates:
+          type: [array, 'null']
+          items: { type: object }
+          description: Optional supporting rows (e.g. the clashing schedule on `SCHEDULE_OVERLAP`).
+    ErrorCode:
+      type: string
+      enum:
+        - NOT_FOUND
+        - PATIENT_NOT_FOUND
+        - DOCTOR_NOT_FOUND
+        - FORBIDDEN_SCOPE
+        - PAST_DATE
+        - NO_SESSION
+        - SESSION_REQUIRED
+        - SESSION_FULL
+        - DUPLICATE_BOOKING
+        - DOCTOR_NOT_ACCEPTING
+        - SCHEDULE_OVERLAP
+        - ROOM_CONFLICT
+        - HAS_DOCTORS
+        - HAS_FUTURE_APPOINTMENTS
+        - DUPLICATE_NAME
+        - IDEMPOTENCY_KEY_REUSED
+        - HOLIDAY
+        - DUPLICATE_DATE
+        - IMPORT_HAS_ERRORS
+        - UNSUPPORTED_FILE
+    Weekday:
+      type: string
+      enum: [saturday, sunday, monday, tuesday, wednesday, thursday, friday]
+    ServiceLine:
+      type: string
+      description: Which call-centre desk handles this department's calls.
+      enum: [appointment, emergency, support]
+    ApiKeyResponse:
+      type: object
+      required: [api_key]
+      properties:
+        api_key: { type: string }
+    Body_login_auth_login_post:
+      type: object
+      required: [username, password]
+      properties:
+        grant_type: { type: [string, 'null'], pattern: password }
+        username: { type: string }
+        password: { type: string, format: password }
+        scope: { type: string, default: '' }
+        client_id: { type: [string, 'null'] }
+        client_secret: { type: [string, 'null'], format: password }
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items: { $ref: '#/components/schemas/ValidationError' }
+    ValidationError:
+      type: object
+      required: [loc, msg, type]
+      properties:
+        loc:
+          type: array
+          items:
+            anyOf: [{ type: string }, { type: integer }]
+        msg: { type: string }
+        type: { type: string }
+
+    # ── patients (unchanged shape) ─────────────────────────────────────────
+    PatientCreate:
+      type: object
+      required: [name, age, mobile_number]
+      properties:
+        name: { type: string, maxLength: 150 }
+        age: { type: integer, minimum: 0, maximum: 150 }
+        mobile_number: { type: string, maxLength: 20 }
+    PatientUpdate:
+      type: object
+      properties:
+        name: { type: [string, 'null'], maxLength: 150 }
+        age: { type: [integer, 'null'], minimum: 0, maximum: 150 }
+        mobile_number: { type: [string, 'null'], maxLength: 20 }
+    PatientOut:
+      type: object
+      required: [name, age, mobile_number, id, created_at]
+      properties:
+        id: { type: integer }
+        name: { type: string, maxLength: 150 }
+        age: { type: integer, minimum: 0, maximum: 150 }
+        mobile_number: { type: string, maxLength: 20 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: [string, 'null'], format: date-time }
+
+    # ── departments (NEW) ──────────────────────────────────────────────────
+    DepartmentBase:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 150
+          description: English display name, e.g. "Obstetrics & Gynaecology".
+        name_bn:
+          type: [string, 'null']
+          maxLength: 150
+          description: Bangla name, as spoken to callers, e.g. "অবস্টেট্রিক্স ও গাইনোকোলজি".
+        aliases:
+          type: array
+          items: { type: string, maxLength: 80 }
+          default: []
+          description: |
+            Other words callers use, in either language and any spelling:
+            ["gynae", "gynecology", "gynaecologist", "স্ত্রীরোগ"]. Matched by
+            `GET /departments?search=`.
+        service_line: { $ref: '#/components/schemas/ServiceLine' }
+        description:
+          type: [string, 'null']
+          description: |
+            What the department does, in English, in a few short paragraphs
+            a caller can be read. No staff contact details. Synced to the
+            voice agent's search index.
+        description_bn:
+          type: [string, 'null']
+          description: NEW in 1.2.0. The same, in Bangla.
+        conditions:
+          type: array
+          items: { type: string, maxLength: 120 }
+          default: []
+          description: |
+            NEW in 1.2.0. Complaints and conditions this department sees, in
+            the words a caller uses, either language: ["kidney stone",
+            "dialysis", "কিডনি", "প্রস্রাবে জ্বালা"]. Lets the agent route
+            "which department for my kidney problem?".
+        opening_hours:
+          type: [string, 'null']
+          maxLength: 200
+          description: Free text, e.g. "8am to 8pm, Saturday to Thursday" or "24 hours".
+        is_active: { type: boolean, default: true }
+    DepartmentCreate:
+      allOf:
+        - $ref: '#/components/schemas/DepartmentBase'
+        - type: object
+          required: [name, service_line]
+    DepartmentUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        name: { type: [string, 'null'], maxLength: 150 }
+        name_bn: { type: [string, 'null'], maxLength: 150 }
+        aliases:
+          type: [array, 'null']
+          items: { type: string, maxLength: 80 }
+        service_line:
+          anyOf:
+            - $ref: '#/components/schemas/ServiceLine'
+            - type: 'null'
+        description: { type: [string, 'null'] }
+        description_bn: { type: [string, 'null'] }
+        conditions:
+          type: [array, 'null']
+          items: { type: string, maxLength: 120 }
+        opening_hours: { type: [string, 'null'], maxLength: 200 }
+        is_active: { type: [boolean, 'null'] }
+    DepartmentOut:
+      allOf:
+        - $ref: '#/components/schemas/DepartmentBase'
+        - type: object
+          required: [id, name, service_line, is_active, created_at]
+          properties:
+            id: { type: integer }
+            doctor_count:
+              type: integer
+              description: Active doctors in this department.
+            created_at: { type: string, format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+            deleted_at: { type: [string, 'null'], format: date-time, description: NEW in 1.2.0. }
+
+    # ── doctors ────────────────────────────────────────────────────────────
+    DoctorBase:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 150
+          description: Full name with honorifics as the hospital writes it.
+        name_bn:
+          type: [string, 'null']
+          maxLength: 150
+          description: NEW in 1.1.0. Bangla spelling of the name.
+        designation: { type: [string, 'null'], description: 'e.g. "Senior Consultant"' }
+        education: { type: [string, 'null'] }
+        specialization:
+          type: [string, 'null']
+          description: Display text only. Use `department_id` for filtering.
+        department_id:
+          type: [integer, 'null']
+          description: NEW in 1.1.0.
+        description: { type: [string, 'null'] }
+        mobile_number:
+          type: [string, 'null']
+          description: Staff-private. Omitted from responses for `agent`-scoped keys.
+        email:
+          type: [string, 'null']
+          description: Staff-private. Omitted from responses for `agent`-scoped keys.
+        is_active:
+          type: boolean
+          default: true
+          description: NEW in 1.1.0. False for doctors who have left; excluded from lists by default.
+        accepting_appointments:
+          type: boolean
+          default: true
+          description: |
+            NEW in 1.1.0. False blocks new bookings (`409
+            DOCTOR_NOT_ACCEPTING`) while keeping the doctor listed.
+        consultation_fee:
+          type: [number, 'null']
+          minimum: 0
+          description: NEW in 1.1.0. In BDT. Null means not published.
+    DoctorCreate:
+      allOf:
+        - $ref: '#/components/schemas/DoctorBase'
+        - type: object
+          required: [name]
+    DoctorUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        name: { type: [string, 'null'], maxLength: 150 }
+        name_bn: { type: [string, 'null'], maxLength: 150 }
+        designation: { type: [string, 'null'] }
+        education: { type: [string, 'null'] }
+        specialization: { type: [string, 'null'] }
+        department_id: { type: [integer, 'null'] }
+        description: { type: [string, 'null'] }
+        mobile_number: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        is_active: { type: [boolean, 'null'] }
+        accepting_appointments: { type: [boolean, 'null'] }
+        consultation_fee: { type: [number, 'null'], minimum: 0 }
+    DoctorOut:
+      allOf:
+        - $ref: '#/components/schemas/DoctorBase'
+        - type: object
+          required: [id, name, is_active, accepting_appointments, created_at]
+          properties:
+            id: { type: integer }
+            department:
+              anyOf:
+                - $ref: '#/components/schemas/DepartmentSummary'
+                - type: 'null'
+            created_at: { type: string, format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+            deleted_at: { type: [string, 'null'], format: date-time, description: NEW in 1.2.0. }
+    DoctorSummary:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        name_bn: { type: [string, 'null'] }
+        designation: { type: [string, 'null'] }
+        specialization: { type: [string, 'null'] }
+    DepartmentSummary:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        name_bn: { type: [string, 'null'] }
+
+    # ── schedules (NEW) ────────────────────────────────────────────────────
+    SessionPlace:
+      type: object
+      properties:
+        room: { type: [string, 'null'], maxLength: 30, description: 'e.g. "3042"' }
+        floor: { type: [string, 'null'], maxLength: 30, description: 'e.g. "3rd"' }
+        desk: { type: [string, 'null'], maxLength: 10, description: 'e.g. "A"' }
+    ScheduleCreate:
+      allOf:
+        - $ref: '#/components/schemas/SessionPlace'
+        - type: object
+          required: [weekday, start_time, end_time, max_patients]
+          properties:
+            weekday: { $ref: '#/components/schemas/Weekday' }
+            start_time: { type: string, format: time, description: 'Local, e.g. "09:00"' }
+            end_time:
+              type: string
+              format: time
+              description: Must be after `start_time`. Sessions do not cross midnight.
+            max_patients:
+              type: integer
+              minimum: 1
+              description: Serials available in this session (its capacity).
+            slot_minutes:
+              type: [integer, 'null']
+              minimum: 1
+              description: |
+                When set, serial N is given the time `start_time + (N-1) *
+                slot_minutes`. When null, every serial shows `start_time`
+                and patients are seen in serial order.
+            report_capacity:
+              type: integer
+              minimum: 0
+              default: 0
+              description: |
+                NEW in 1.2.0. Separate serials for `report_showing` visits,
+                which then do not use up the regular `max_patients`. 0 means
+                report visits take regular serials.
+            valid_from:
+              type: [string, 'null']
+              format: date
+              description: First date this row applies. Null means already in effect.
+            valid_to:
+              type: [string, 'null']
+              format: date
+              description: Last date this row applies. Null means open-ended.
+            is_active: { type: boolean, default: true }
+    ScheduleUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        weekday:
+          anyOf:
+            - $ref: '#/components/schemas/Weekday'
+            - type: 'null'
+        start_time: { type: [string, 'null'], format: time }
+        end_time: { type: [string, 'null'], format: time }
+        room: { type: [string, 'null'], maxLength: 30 }
+        floor: { type: [string, 'null'], maxLength: 30 }
+        desk: { type: [string, 'null'], maxLength: 10 }
+        max_patients: { type: [integer, 'null'], minimum: 1 }
+        slot_minutes: { type: [integer, 'null'], minimum: 1 }
+        report_capacity: { type: [integer, 'null'], minimum: 0 }
+        valid_from: { type: [string, 'null'], format: date }
+        valid_to: { type: [string, 'null'], format: date }
+        is_active: { type: [boolean, 'null'] }
+    ScheduleOut:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleCreate'
+        - type: object
+          required: [id, doctor_id, created_at]
+          properties:
+            id: { type: integer }
+            doctor_id: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+    ScheduleChangeResult:
+      type: object
+      required: [schedule, affected_appointments]
+      properties:
+        schedule: { $ref: '#/components/schemas/ScheduleOut' }
+        affected_appointments:
+          type: array
+          items: { $ref: '#/components/schemas/AppointmentDetailOut' }
+          description: |
+            Scheduled appointments from today onward that no longer fall
+            inside any session of this doctor. They are NOT changed — staff
+            must contact the patients and cancel or rebook.
+
+    ExceptionType:
+      type: string
+      enum: [leave, cancelled, extra_session]
+      description: |
+        - `leave` — the doctor is away; every session that date is off.
+        - `cancelled` — one session that date is off (`schedule_id` required).
+        - `extra_session` — a one-off session that date (`start_time`,
+          `end_time`, `max_patients` required).
+    ScheduleExceptionCreate:
+      allOf:
+        - $ref: '#/components/schemas/SessionPlace'
+        - type: object
+          required: [date, type]
+          properties:
+            date: { type: string, format: date }
+            type: { $ref: '#/components/schemas/ExceptionType' }
+            schedule_id:
+              type: [integer, 'null']
+              description: Required for `cancelled`; ignored otherwise.
+            start_time: { type: [string, 'null'], format: time }
+            end_time: { type: [string, 'null'], format: time }
+            max_patients: { type: [integer, 'null'], minimum: 1 }
+            slot_minutes: { type: [integer, 'null'], minimum: 1 }
+            report_capacity: { type: [integer, 'null'], minimum: 0 }
+            note:
+              type: [string, 'null']
+              maxLength: 500
+              description: Staff-internal reason. Omitted from responses for `agent`-scoped keys.
+    ScheduleExceptionOut:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleExceptionCreate'
+        - type: object
+          required: [id, doctor_id, created_at]
+          properties:
+            id: { type: integer }
+            doctor_id: { type: integer }
+            created_at: { type: string, format: date-time }
+    ScheduleExceptionResult:
+      type: object
+      required: [exception, affected_appointments]
+      properties:
+        exception: { $ref: '#/components/schemas/ScheduleExceptionOut' }
+        affected_appointments:
+          type: array
+          items: { $ref: '#/components/schemas/AppointmentDetailOut' }
+          description: Appointments on that date that no longer fall inside a session. NOT changed.
+
+    # ── availability (NEW) ─────────────────────────────────────────────────
+    DayStatus:
+      type: string
+      enum: [available, full, leave, no_session, holiday]
+      description: |
+        Checked in this order:
+        - `holiday` — NEW in 1.2.0. A hospital holiday with `opd_closed`.
+        - `leave` — a `leave` exception, or every session `cancelled`.
+        - `no_session` — no schedule row for that weekday/date.
+        - `available` — at least one session with `remaining > 0`.
+        - `full` — sessions exist, all with `remaining == 0`.
+    AvailableSession:
+      allOf:
+        - $ref: '#/components/schemas/SessionPlace'
+        - type: object
+          required: [start_time, end_time, capacity, booked, remaining]
+          properties:
+            schedule_id:
+              type: [integer, 'null']
+              description: Null for an `extra_session` exception.
+            exception_id:
+              type: [integer, 'null']
+              description: Set for an `extra_session` exception.
+            start_time: { type: string, format: time }
+            end_time: { type: string, format: time }
+            capacity: { type: integer }
+            booked: { type: integer, description: 'Appointments not `cancelled` (a `completed` one still used its serial).' }
+            remaining: { type: integer }
+            next_serial:
+              type: [integer, 'null']
+              description: The serial the next booking would get. Null when full.
+            report_capacity: { type: integer, description: NEW in 1.2.0. 0 when report visits use regular serials. }
+            report_booked: { type: integer, description: NEW in 1.2.0. }
+            report_remaining: { type: integer, description: NEW in 1.2.0. }
+            now_serving:
+              type: [integer, 'null']
+              description: NEW in 1.2.0, OPTIONAL queue feature. Today only; null otherwise or when not tracked.
+    AvailabilityDay:
+      type: object
+      required: [date, weekday, status, sessions]
+      properties:
+        date: { type: string, format: date }
+        weekday: { $ref: '#/components/schemas/Weekday' }
+        status: { $ref: '#/components/schemas/DayStatus' }
+        holiday_name:
+          type: [string, 'null']
+          description: NEW in 1.2.0. Set when `status` is `holiday`.
+        sessions:
+          type: array
+          items: { $ref: '#/components/schemas/AvailableSession' }
+          description: Empty unless status is `available` or `full`.
+    DoctorAvailability:
+      type: object
+      required: [doctor_id, doctor_name, days]
+      properties:
+        doctor_id: { type: integer }
+        doctor_name: { type: string }
+        doctor_name_bn: { type: [string, 'null'] }
+        department:
+          anyOf:
+            - $ref: '#/components/schemas/DepartmentSummary'
+            - type: 'null'
+        accepting_appointments: { type: boolean }
+        days:
+          type: array
+          items: { $ref: '#/components/schemas/AvailabilityDay' }
+
+    # ── appointments ───────────────────────────────────────────────────────
+    AppointmentStatus:
+      type: string
+      enum: [scheduled, completed, cancelled]
+    AppointmentSource:
+      type: string
+      enum: [voice_agent, call_center, front_desk, web, other]
+    VisitType:
+      type: string
+      description: NEW in 1.2.0.
+      enum: [new, follow_up, report_showing]
+    QueueName:
+      type: string
+      description: |
+        NEW in 1.2.0. `report` only exists for sessions with
+        `report_capacity > 0`.
+      enum: [regular, report]
+      default: regular
+    AppointmentCreate:
+      type: object
+      required: [patient_id, doctor_id, appointment_date]
+      properties:
+        patient_id: { type: integer }
+        doctor_id: { type: integer }
+        appointment_date: { type: string, format: date }
+        schedule_id:
+          type: [integer, 'null']
+          description: |
+            NEW in 1.1.0. Which session, when the doctor has more than one
+            that date. May reference an `extra_session` via `exception_id`
+            instead.
+        exception_id:
+          type: [integer, 'null']
+          description: NEW in 1.1.0. Book into an `extra_session` exception.
+        appointment_time:
+          type: [string, 'null']
+          format: time
+          deprecated: true
+          description: |
+            CHANGED in 1.1.0: optional and IGNORED — the server derives it
+            from the serial. Kept so 1.0.0 clients still validate.
+        status:
+          $ref: '#/components/schemas/AppointmentStatus'
+          default: scheduled
+        source:
+          anyOf:
+            - $ref: '#/components/schemas/AppointmentSource'
+            - type: 'null'
+          description: NEW in 1.1.0. Where the booking came from, for reporting.
+        visit_type:
+          $ref: '#/components/schemas/VisitType'
+          default: new
+          description: NEW in 1.2.0. Decides the queue; see `POST /appointments`.
+        notes: { type: [string, 'null'] }
+    AppointmentUpdate:
+      type: object
+      properties:
+        patient_id: { type: [integer, 'null'] }
+        doctor_id: { type: [integer, 'null'] }
+        appointment_date: { type: [string, 'null'], format: date }
+        schedule_id: { type: [integer, 'null'] }
+        exception_id: { type: [integer, 'null'] }
+        appointment_time:
+          type: [string, 'null']
+          format: time
+          deprecated: true
+          description: Ignored; derived by the server.
+        status:
+          anyOf:
+            - $ref: '#/components/schemas/AppointmentStatus'
+            - type: 'null'
+        cancel_reason:
+          type: [string, 'null']
+          maxLength: 300
+          description: NEW in 1.1.0. Recorded when `status` becomes `cancelled`.
+        visit_type:
+          anyOf:
+            - $ref: '#/components/schemas/VisitType'
+            - type: 'null'
+          description: NEW in 1.2.0. Changing it may move the appointment to the other queue and a new serial.
+        notes: { type: [string, 'null'] }
+    AppointmentOut:
+      type: object
+      required: [id, patient_id, doctor_id, appointment_date, appointment_time,
+                 serial_number, status, created_at]
+      properties:
+        id: { type: integer }
+        patient_id: { type: integer }
+        doctor_id: { type: integer }
+        appointment_date: { type: string, format: date }
+        appointment_time:
+          type: string
+          format: time
+          description: Derived from the session and serial.
+        serial_number:
+          type: integer
+          minimum: 1
+          description: NEW in 1.1.0. Position in the session's queue; 1 is first.
+        visit_type: { $ref: '#/components/schemas/VisitType' }
+        queue:
+          $ref: '#/components/schemas/QueueName'
+          description: NEW in 1.2.0. `serial_number` counts within this queue.
+        schedule_id: { type: [integer, 'null'], description: NEW in 1.1.0. }
+        exception_id: { type: [integer, 'null'], description: NEW in 1.1.0. }
+        session_start: { type: [string, 'null'], format: time, description: NEW in 1.1.0. }
+        session_end: { type: [string, 'null'], format: time, description: NEW in 1.1.0. }
+        room: { type: [string, 'null'], description: NEW in 1.1.0. Copied from the session at booking time. }
+        floor: { type: [string, 'null'], description: NEW in 1.1.0. }
+        desk: { type: [string, 'null'], description: NEW in 1.1.0. }
+        status:
+          $ref: '#/components/schemas/AppointmentStatus'
+        source:
+          anyOf:
+            - $ref: '#/components/schemas/AppointmentSource'
+            - type: 'null'
+        cancel_reason: { type: [string, 'null'] }
+        notes: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: [string, 'null'], format: date-time }
+    AppointmentDetailOut:
+      allOf:
+        - $ref: '#/components/schemas/AppointmentOut'
+        - type: object
+          required: [patient, doctor]
+          properties:
+            patient: { $ref: '#/components/schemas/PatientOut' }
+            doctor: { $ref: '#/components/schemas/DoctorOut' }
+
+    # ── holidays (NEW in 1.2.0) ────────────────────────────────────────────
+    HolidayCreate:
+      type: object
+      required: [date, name]
+      properties:
+        date: { type: string, format: date }
+        name: { type: string, maxLength: 150, description: 'e.g. "Durga Puja"' }
+        name_bn: { type: [string, 'null'], maxLength: 150, description: 'e.g. "দুর্গাপূজা"' }
+        opd_closed:
+          type: boolean
+          default: true
+          description: False records the holiday without closing OPD (e.g. reduced hours handled by exceptions).
+        emergency_open:
+          type: boolean
+          default: true
+          description: The agent says emergency stays open when true.
+        note:
+          type: [string, 'null']
+          maxLength: 500
+          description: Staff-only. Omitted for `agent` keys.
+    HolidayUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        date: { type: [string, 'null'], format: date }
+        name: { type: [string, 'null'], maxLength: 150 }
+        name_bn: { type: [string, 'null'], maxLength: 150 }
+        opd_closed: { type: [boolean, 'null'] }
+        emergency_open: { type: [boolean, 'null'] }
+        note: { type: [string, 'null'], maxLength: 500 }
+    HolidayOut:
+      allOf:
+        - $ref: '#/components/schemas/HolidayCreate'
+        - type: object
+          required: [id, created_at]
+          properties:
+            id: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+    HolidayResult:
+      type: object
+      required: [holiday, affected_appointments]
+      properties:
+        holiday: { $ref: '#/components/schemas/HolidayOut' }
+        affected_appointments:
+          type: array
+          items: { $ref: '#/components/schemas/AppointmentDetailOut' }
+          description: Non-cancelled appointments on the date when `opd_closed`. NOT changed.
+
+    # ── schedule import (NEW in 1.2.0) ─────────────────────────────────────
+    ImportProblemCode:
+      type: string
+      enum:
+        - UNKNOWN_DOCTOR
+        - AMBIGUOUS_DOCTOR
+        - BLANK_HOURS
+        - UNPARSEABLE_HOURS
+        - MISSING_CAPACITY
+        - SCHEDULE_OVERLAP
+        - ROOM_CONFLICT
+        - NOT_IN_FILE
+        - FACILITY_ROW
+        - MOBILE_REMOVED
+      description: |
+        - `UNKNOWN_DOCTOR` (error) — no CRM doctor has that name.
+        - `AMBIGUOUS_DOCTOR` (error) — more than one does.
+        - `BLANK_HOURS` (error) — a day cell is empty, not `x`.
+        - `UNPARSEABLE_HOURS` (error) — hours not in `hh:mm am To hh:mm pm`.
+        - `MISSING_CAPACITY` (error) — see `default_max_patients`.
+        - `SCHEDULE_OVERLAP`, `ROOM_CONFLICT` (error) — as for schedules.
+        - `NOT_IN_FILE` (warning) — an active doctor with a schedule who is
+          absent from the file; their schedule is left as it is.
+        - `FACILITY_ROW` (warning) — a room with no doctor; skipped.
+        - `MOBILE_REMOVED` (info) — a phone number in a name cell was dropped.
+    ImportProblem:
+      type: object
+      required: [severity, code, detail]
+      properties:
+        severity: { type: string, enum: [error, warning, info] }
+        code: { $ref: '#/components/schemas/ImportProblemCode' }
+        row: { type: [integer, 'null'], description: 1-based spreadsheet or CSV row. }
+        doctor_name: { type: [string, 'null'] }
+        weekday:
+          anyOf:
+            - $ref: '#/components/schemas/Weekday'
+            - type: 'null'
+        detail: { type: string }
+    ImportedDoctor:
+      type: object
+      required: [doctor_id, doctor_name, sessions]
+      properties:
+        doctor_id: { type: integer }
+        doctor_name: { type: string }
+        sessions:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleCreate' }
+          description: The sessions the file produces for this doctor.
+        changed:
+          type: boolean
+          description: False when the file's sessions equal the doctor's current ones.
+    ScheduleImportResult:
+      type: object
+      required: [mode, valid_from, summary, doctors, problems, affected_appointments]
+      properties:
+        mode: { type: string, enum: [preview, apply] }
+        applied: { type: boolean, description: True only for a committed apply. }
+        valid_from: { type: string, format: date }
+        summary:
+          type: object
+          properties:
+            doctors_in_file: { type: integer }
+            doctors_changed: { type: integer }
+            sessions: { type: integer }
+            errors: { type: integer }
+            warnings: { type: integer }
+            mobiles_removed: { type: integer }
+        doctors:
+          type: array
+          items: { $ref: '#/components/schemas/ImportedDoctor' }
+        problems:
+          type: array
+          items: { $ref: '#/components/schemas/ImportProblem' }
+        affected_appointments:
+          type: array
+          items: { $ref: '#/components/schemas/AppointmentDetailOut' }
+          description: Future appointments that would no longer fall inside a session. NOT changed.
+
+    # ── audit (NEW in 1.2.0) ───────────────────────────────────────────────
+    AuditEntityType:
+      type: string
+      enum: [doctor, department, schedule, exception, holiday, package, service, article, hospital]
+    AuditEntry:
+      type: object
+      required: [id, at, user_id, action, entity_type, entity_id]
+      properties:
+        id: { type: integer }
+        at: { type: string, format: date-time }
+        user_id: { type: integer }
+        username: { type: string }
+        action: { type: string, enum: [create, update, delete, import] }
+        entity_type: { $ref: '#/components/schemas/AuditEntityType' }
+        entity_id: { type: integer }
+        doctor_id:
+          type: [integer, 'null']
+          description: For doctor, schedule and exception entries.
+        before:
+          type: [object, 'null']
+          description: The record before the change; null on create.
+        after:
+          type: [object, 'null']
+          description: The record after the change; null on delete.
+
+    # ── hospital (NEW in 1.2.0) ────────────────────────────────────────────
+    ContactLine:
+      type: object
+      required: [label, value]
+      properties:
+        label: { type: string, maxLength: 80, description: 'e.g. "Home-service helpline"' }
+        label_bn: { type: [string, 'null'], maxLength: 80 }
+        value: { type: string, maxLength: 120, description: A PUBLIC number or address, never a staff member's own. }
+        hours: { type: [string, 'null'], maxLength: 80, description: 'e.g. "24 hours"' }
+    DeskHours:
+      type: object
+      description: When each call-centre desk is staffed. Replaces the voice agent's `CRM_OPENING_HOURS` setting.
+      properties:
+        appointment: { type: [string, 'null'], maxLength: 120 }
+        emergency: { type: [string, 'null'], maxLength: 120 }
+        support: { type: [string, 'null'], maxLength: 120 }
+    HospitalUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        name: { type: [string, 'null'], maxLength: 150 }
+        name_bn: { type: [string, 'null'], maxLength: 150 }
+        address: { type: [string, 'null'], maxLength: 300 }
+        address_bn: { type: [string, 'null'], maxLength: 300 }
+        landmark: { type: [string, 'null'], maxLength: 200, description: 'How to find it, e.g. "on Green Road, Dhanmondi".' }
+        landmark_bn: { type: [string, 'null'], maxLength: 200 }
+        main_phone: { type: [string, 'null'], maxLength: 40 }
+        emergency_hotline: { type: [string, 'null'], maxLength: 40 }
+        email: { type: [string, 'null'], maxLength: 120 }
+        website: { type: [string, 'null'], maxLength: 200 }
+        other_contacts:
+          type: [array, 'null']
+          items: { $ref: '#/components/schemas/ContactLine' }
+        opd_hours: { type: [string, 'null'], maxLength: 200, description: 'General OPD hours, e.g. "9am to 10pm; each doctor''s hours differ".' }
+        opd_hours_bn: { type: [string, 'null'], maxLength: 200 }
+        friday_note: { type: [string, 'null'], maxLength: 200, description: 'e.g. "Almost no OPD clinics run on Friday".' }
+        friday_note_bn: { type: [string, 'null'], maxLength: 200 }
+        desk_hours:
+          anyOf:
+            - $ref: '#/components/schemas/DeskHours'
+            - type: 'null'
+        beds: { type: [integer, 'null'], minimum: 0 }
+    HospitalOut:
+      allOf:
+        - $ref: '#/components/schemas/HospitalUpdate'
+        - type: object
+          required: [name, updated_at]
+          properties:
+            updated_at: { type: string, format: date-time }
+
+    # ── packages (NEW in 1.2.0) ────────────────────────────────────────────
+    PackageGender:
+      type: string
+      enum: [male, female, any]
+    PackageCreate:
+      type: object
+      required: [name, price]
+      properties:
+        name: { type: string, maxLength: 150, description: 'e.g. "Gold Health Checkup (Male)"' }
+        name_bn: { type: [string, 'null'], maxLength: 150 }
+        aliases:
+          type: array
+          items: { type: string, maxLength: 80 }
+          default: []
+          description: 'Other names callers use: ["gold package", "গোল্ড চেকআপ"].'
+        price: { type: number, minimum: 0, description: Price the caller pays, BDT. }
+        regular_price:
+          type: [number, 'null']
+          minimum: 0
+          description: Undiscounted price, BDT, when there is an offer.
+        gender: { $ref: '#/components/schemas/PackageGender' }
+        age_group: { type: [string, 'null'], maxLength: 80, description: 'e.g. "above 40 years"' }
+        investigations:
+          type: array
+          items: { type: string, maxLength: 120 }
+          default: []
+          description: 'Tests included: ["CBC with ESR", "HbA1c", "TSH"].'
+        complementary:
+          type: array
+          items: { type: string, maxLength: 120 }
+          default: []
+          description: 'Consultations and extras: ["Gynaecologist consultation"].'
+        description: { type: [string, 'null'] }
+        description_bn: { type: [string, 'null'] }
+        preparation:
+          type: [string, 'null']
+          description: 'e.g. "Fasting for 10 hours before the test". Read to callers who ask.'
+        is_active: { type: boolean, default: true }
+    PackageUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        name: { type: [string, 'null'], maxLength: 150 }
+        name_bn: { type: [string, 'null'], maxLength: 150 }
+        aliases: { type: [array, 'null'], items: { type: string, maxLength: 80 } }
+        price: { type: [number, 'null'], minimum: 0 }
+        regular_price: { type: [number, 'null'], minimum: 0 }
+        gender:
+          anyOf:
+            - $ref: '#/components/schemas/PackageGender'
+            - type: 'null'
+        age_group: { type: [string, 'null'], maxLength: 80 }
+        investigations: { type: [array, 'null'], items: { type: string, maxLength: 120 } }
+        complementary: { type: [array, 'null'], items: { type: string, maxLength: 120 } }
+        description: { type: [string, 'null'] }
+        description_bn: { type: [string, 'null'] }
+        preparation: { type: [string, 'null'] }
+        is_active: { type: [boolean, 'null'] }
+    PackageOut:
+      allOf:
+        - $ref: '#/components/schemas/PackageCreate'
+        - type: object
+          required: [id, created_at]
+          properties:
+            id: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+            deleted_at: { type: [string, 'null'], format: date-time }
+
+    # ── services (NEW in 1.2.0) ────────────────────────────────────────────
+    ServiceKind:
+      type: string
+      enum: [service, facility]
+      description: |
+        - `service` — something a patient can use or ask about (hemodialysis,
+          laboratory, radiology, blood bank, home service).
+        - `facility` — a room patients are sent to (PFT room, EEG room, ETT
+          room, breastfeeding room), mostly for directions.
+    ServiceCreate:
+      allOf:
+        - $ref: '#/components/schemas/SessionPlace'
+        - type: object
+          required: [name, kind, service_line]
+          properties:
+            name: { type: string, maxLength: 150 }
+            name_bn: { type: [string, 'null'], maxLength: 150 }
+            aliases:
+              type: array
+              items: { type: string, maxLength: 80 }
+              default: []
+            kind: { $ref: '#/components/schemas/ServiceKind' }
+            service_line: { $ref: '#/components/schemas/ServiceLine' }
+            department_id: { type: [integer, 'null'] }
+            description: { type: [string, 'null'] }
+            description_bn: { type: [string, 'null'] }
+            hours: { type: [string, 'null'], maxLength: 120, description: 'e.g. "8am to 8pm, Saturday to Thursday"' }
+            is_24x7: { type: boolean, default: false }
+            phone:
+              type: [string, 'null']
+              maxLength: 40
+              description: A PUBLIC helpline for this service, if it has its own.
+            is_active: { type: boolean, default: true }
+    ServiceUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        name: { type: [string, 'null'], maxLength: 150 }
+        name_bn: { type: [string, 'null'], maxLength: 150 }
+        aliases: { type: [array, 'null'], items: { type: string, maxLength: 80 } }
+        kind:
+          anyOf:
+            - $ref: '#/components/schemas/ServiceKind'
+            - type: 'null'
+        service_line:
+          anyOf:
+            - $ref: '#/components/schemas/ServiceLine'
+            - type: 'null'
+        department_id: { type: [integer, 'null'] }
+        description: { type: [string, 'null'] }
+        description_bn: { type: [string, 'null'] }
+        hours: { type: [string, 'null'], maxLength: 120 }
+        is_24x7: { type: [boolean, 'null'] }
+        phone: { type: [string, 'null'], maxLength: 40 }
+        room: { type: [string, 'null'], maxLength: 30 }
+        floor: { type: [string, 'null'], maxLength: 30 }
+        desk: { type: [string, 'null'], maxLength: 10 }
+        is_active: { type: [boolean, 'null'] }
+    ServiceOut:
+      allOf:
+        - $ref: '#/components/schemas/ServiceCreate'
+        - type: object
+          required: [id, created_at]
+          properties:
+            id: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+            deleted_at: { type: [string, 'null'], format: date-time }
+
+    # ── articles (NEW in 1.2.0) ────────────────────────────────────────────
+    ArticleTopic:
+      type: string
+      enum: [booking, about, directions, policy, career, other]
+    ArticleCreate:
+      type: object
+      required: [title, topic]
+      properties:
+        title: { type: string, maxLength: 200, description: 'e.g. "How to book an appointment"' }
+        title_bn: { type: [string, 'null'], maxLength: 200 }
+        topic: { $ref: '#/components/schemas/ArticleTopic' }
+        service_line:
+          anyOf:
+            - $ref: '#/components/schemas/ServiceLine'
+            - type: 'null'
+          description: The desk this answers for. Null means every desk (shared).
+        questions:
+          type: array
+          items: { type: string, maxLength: 200 }
+          default: []
+          description: |
+            How callers actually ask it, several phrasings, either language:
+            ["সিরিয়াল কীভাবে নেব?", "অ্যাপয়েন্টমেন্ট কীভাবে করা যায়?"].
+            Improves search matching.
+        body:
+          type: [string, 'null']
+          description: The answer in English, short and speakable.
+        body_bn:
+          type: [string, 'null']
+          description: The answer in Bangla. At least one of `body`, `body_bn` is required.
+        is_published: { type: boolean, default: false }
+    ArticleUpdate:
+      type: object
+      description: Every field optional; omitted fields are unchanged.
+      properties:
+        title: { type: [string, 'null'], maxLength: 200 }
+        title_bn: { type: [string, 'null'], maxLength: 200 }
+        topic:
+          anyOf:
+            - $ref: '#/components/schemas/ArticleTopic'
+            - type: 'null'
+        service_line:
+          anyOf:
+            - $ref: '#/components/schemas/ServiceLine'
+            - type: 'null'
+        questions: { type: [array, 'null'], items: { type: string, maxLength: 200 } }
+        body: { type: [string, 'null'] }
+        body_bn: { type: [string, 'null'] }
+        is_published: { type: [boolean, 'null'] }
+    ArticleOut:
+      allOf:
+        - $ref: '#/components/schemas/ArticleCreate'
+        - type: object
+          required: [id, created_at]
+          properties:
+            id: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+            deleted_at: { type: [string, 'null'], format: date-time }
+
+    # ── queue (NEW in 1.2.0, OPTIONAL) ─────────────────────────────────────
+    QueueStatus:
+      type: object
+      required: [schedule_id, doctor_id, date, queue, now_serving, booked]
+      properties:
+        schedule_id: { type: integer }
+        doctor_id: { type: integer }
+        doctor_name: { type: string }
+        date: { type: string, format: date }
+        queue: { $ref: '#/components/schemas/QueueName' }
+        now_serving: { type: integer, description: '0 means not started.' }
+        booked: { type: integer }
+        updated_at: { type: [string, 'null'], format: date-time }

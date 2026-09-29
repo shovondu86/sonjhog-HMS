@@ -1,41 +1,47 @@
 """
-Creates the login user since there is no registration endpoint.
-Run once after setting up the database:
+Creates the login users, since there is no registration endpoint.
+Run once after setting up the database (safe to re-run):
 
     python -m app.seed
+
+Creates `admin` (full access) and, if AGENT_USERNAME / AGENT_PASSWORD are set in .env,
+an `agent` user (the voice agent: reads everything, writes only patients + appointments).
 """
-
-from app.database import Base, engine, SessionLocal
-from app.models import User
-from app.security import hash_password, generate_api_key
+from app import migrate
 from app.config import settings
+from app.database import SessionLocal
+from app.models import User
+from app.security import generate_api_key, hash_password
 
-Base.metadata.create_all(bind=engine)
+
+def _ensure(db, username: str, password: str, scope: str) -> None:
+    existing = db.query(User).filter(User.username == username).first()
+    if existing:
+        print(f"User '{username}' ({existing.scope}) already exists.")
+        print(f"  API key: {existing.api_key}")
+        return
+    user = User(
+        username=username, hashed_password=hash_password(password),
+        api_key=generate_api_key(), scope=scope,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    print(f"Created {scope} user: username='{username}'")
+    print(f"  API key: {user.api_key}")
 
 
-def seed_admin_user():
+def seed() -> None:
+    migrate.run()
     db = SessionLocal()
     try:
-        existing = db.query(User).filter(User.username == settings.admin_username).first()
-        if existing:
-            print(f"User '{settings.admin_username}' already exists.")
-            print(f"API key: {existing.api_key}")
-            return
-
-        user = User(
-            username=settings.admin_username,
-            hashed_password=hash_password(settings.admin_password),
-            api_key=generate_api_key(),
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        print(f"Created login user: username='{settings.admin_username}'")
-        print(f"API key: {user.api_key}")
-        print("Save this — it's also returned by POST /auth/login.")
+        _ensure(db, settings.admin_username, settings.admin_password, "admin")
+        if settings.agent_username and settings.agent_password:
+            _ensure(db, settings.agent_username, settings.agent_password, "agent")
+        print("Save these keys — they are also returned by POST /auth/login.")
     finally:
         db.close()
 
 
 if __name__ == "__main__":
-    seed_admin_user()
+    seed()
